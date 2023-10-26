@@ -1,0 +1,344 @@
+```{r message=FALSE, include=FALSE}
+library(tidyr)
+library(ISLR)
+library(corrplot)
+library(GGally)
+library(MASS)
+library(DMwR)
+library(class)
+library(knitr)
+library(caTools)
+library(caret)
+library(ggplot2)
+library(ROSE)
+library(rpart)
+library(Rborist)
+library(dplyr)
+library(plotly)
+library(kableExtra)
+library(pROC)
+library(xgboost)
+```
+
+# Introduction
+
+Credit card fraud and prevention is a large and ever-growing segment of financial institutions. Hundreds of millions of dollars of loss are caused every year by fraudulent credit card activity. Investigators for regulators, card providers, and banks dedicate considerable time and resources to design efficient fraudulent detection algorithms in an effort to reduce these losses. Because the data is non-stationary, has a highly unbalanced distribution, and are recorded in a continuous time series, creating solutions for credit card fraud prevention presents unique difficulties.
+
+The data set used in this analysis contains credit card transactions in September of 2013 by European cardholders over two days. There are 284,807 transactions total and 31 variables included. 492 transactions were fraudulent, demonstrating the degree of the imbalance as the positive class (fraudulent) account for 0.172% of all transactions. 
+
+This paper will explore various sampling methods on the training data set to handle the nature of the imbalanced classification in the data, and to develop algorithms using a toolbox of logistic regression, linear discriminant analysis (LDA), quadratic discriminant analysis (QDA), and random forests. As suggested by the authors of the data set, due to the class imbalance, the accuracy of the Area Under the Precision-Recall Curve (AUPRC, or simply AUC) will be measured, as confusion matrix accuracy is not meaningful for unbalanced classification. 
+
+# Exploratory Data
+
+```{r}
+CreditCard=read.csv('creditcard.csv')
+```
+
+
+**Figure 1: Bar plot demonstrating Class imbalance**
+
+```{r}
+### Bar plot to demonstrate Class imbalance
+ggplot(data = CreditCard, aes(x = factor(Class), y = prop.table(after_stat(count)), fill = factor(Class))) + 
+  geom_bar() +
+  scale_x_discrete(labels = c("Non Fraudulent", "Fraudulent")) +
+  scale_y_continuous(labels = scales::percent) + 
+  labs(x = 'Class', y = 'Percentage') +
+  theme(legend.position = "none")
+```
+
+From the above figure and output, it can be observed that the data set is highly imbalanced. We can see that 99.83% of all transactions are non-fraudulent, and so a measure such as accuracy from a confusion matrix is not appropriate as it will always output over 99% accuracy given a threshold-dependent classifier. A more appropriate performance measure such as the Area Under the Precision-Recall Curve (AUC), will be more useful here. As summarized in **Reference [1]** by Dan Martin, this data set requires a threshold-invariant classifier to measure model performance. The AUC does this by giving the probability that a random positive instance will have higher estimated probability than a random negative instance.
+
+Seeing as this is also time-series financial data, it is worth taking a look at the distribution of non-fraudulent and fraudulent activity over time. We can do this by plotting the number of instances of each type of transaction against the *Time* in seconds from the first transaction shown in **Figure 3** below.
+
+
+**Figure 3: Histogram of number of transactions by Class per second elapsed since first transaction**
+
+```{r}
+### Generate histogram of number of transactions by Class per second elapsed since first transaction
+CreditCard %>%
+  ggplot(aes(x = Time, fill = factor(Class))) +
+  geom_histogram(bins = 100) + 
+  facet_grid(Class ~., scales = 'free_y') +
+  labs(x = 'Time (seconds) Since First Transaction', y = 'Number of Transactions') +
+  scale_fill_discrete(name = "Class", labels = c("Non-Fraudulent", "Fraudulent"))
+```
+
+Looking for patterns, it is clear that the non-fraudulent transaction activity appears to have a cyclical distribution, while the fraudulent activity has a somewhat normal distribution but is a bit of a stretch to claim. For instance one of the highest counts of fraud occurring was around the start of the first cycle for regular transactions, with the second highest count being close to when the first cycle ends. However the same can't be said for the second cycle of transactions. The data is capturing two different days as well, so it is possible that for the two days of the week when the data was captured, fraudulent attacks just happened to be more targeted on that given day.
+
+**Figure 4: Correlation plot of data set with Time removed**
+
+```{r}
+### Remove the Time variable and generate correlation plot
+minus.t <- CreditCard[ , ! names(CreditCard) %in% c("Time")]
+M = cor(minus.t)
+corrplot(M, method='square', type = 'lower', number.cex = 0.9, tl.cex = 0.7, tl.col = 'black')
+```
+
+
+The majority of the data set is not correlated, and this is easily explained by the fact that *V1-V28* underwent a Principal Component Analysis (PCA) transformation due to the confidentiality they held. The numbering of the variables is likely unrelated to any kind of order of importance they had within the broader scope of the data as well.
+
+# Data Preparation
+
+Prior to analysis, a couple of checks and modifications will be done in order to better clean and organize the data in a manner fit for the kinds of sampling and algorithms we'd like to create. The first being the *Time* variable, which in this purpose is an ordered value for when the transaction occurred relative to some timestamp. This isn't particularly useful going forward, and as was seen in the exploratory analysis above, has little to no real significance when it comes to classifying a transaction as fraudulent or not. So, we will remove this from the data going forward.
+
+The next step will be modifying R's reading of the *Class* variable. We want to have this read in as a factor rather than just an integer, and so going forward it will be of type factor and will have the levels "NF" for non-fraudulent transactions and "F" for fraudulent transactions. The remaining numeric variables (all but the *Class* variable) were then scaled.
+
+```{r}
+CreditCard$Class <- as.factor(CreditCard$Class)
+CreditCard <- CreditCard[ , ! names(CreditCard) %in% c("Time")]
+```
+
+The last step before any sampling technique or algorithm is trained is splitting the data into a training set and a test set.
+The data is now ready for analysis.
+
+```{r}
+set.seed(65)
+trainIndex <- createDataPartition(CreditCard$Class, p = .8, list = FALSE, times = 1)
+train_set <- CreditCard[trainIndex, ]
+test_set   <- CreditCard[-trainIndex, ]
+```
+
+
+# Analysis
+
+## Logistic Regression
+
+Logistic regression models the probability that our response, *Class* belongs to a particular category, in this case a non-fraudulent or fraudulent transaction.
+
+```{r message=FALSE, warning=FALSE}
+set.seed(222)
+### Fit Logistic Regression model
+log.fit <- glm(Class ~., data = train_set, family = "binomial")
+
+threshold <- 0.5  # Adjust threshold as needed
+
+log.pred <- predict(log.fit, newdata = test_set, type = 'response')
+log.pred.cat <- ifelse(log.pred > threshold, 1, 0)
+
+#Confusion Matrix
+log_cm <- confusionMatrix(table(Predicted = log.pred.cat, Actual = test_set$Class), positive="1")
+log_cm
+
+
+# Create a ROC curve object
+log_roc <- roc(response = test_set$Class, predictor = log.pred)
+
+# Plot the ROC curve
+plot(log_roc, main = "ROC Curve", print.auc = TRUE)
+```
+
+
+
+## Linear Discriminant Analysis (LDA)
+
+The Linear Discriminant Analysis (LDA) classifier results from assuming that the observations are drawn from a multivariate Gaussian (or multivariate normal) distribution, with a class-specific mean vector and a common covariance matrix.
+
+```{r message=FALSE, warning=FALSE}
+set.seed(222)
+### Fit LDA model
+lda.fit <- lda(Class ~ ., data = train_set, family = "binomial")
+
+lda.pred <- predict(lda.fit, newdata = test_set)
+
+#Confusion Matrix
+lda_cm <- confusionMatrix(table(Predicted = lda.pred$class, Actual = test_set$Class), positive="1")
+lda_cm
+
+# levels = c(0, 1), direction = "<"
+# Plot the ROC curve
+lda_roc <- roc(test_set$Class ~ lda.pred$posterior[,2],plot=T,print.auc=T, levels = c(0, 1), direction = "<")
+```
+
+
+## Quadratic Discriminant Analysis (QDA)
+
+The Quadratic Discriminant Analysis (QDA) classifier results from assuming that the observations from each class are from a Gaussian distribution, and using estimates for the parameters into Bayes' theorem in order to perform a prediction. It also assumes that each class has its own covariance matrix.
+
+```{r message=FALSE, warning=FALSE}
+set.seed(222)
+### Fit QDA model
+qda.fit <- qda(Class ~ ., data = train_set)
+
+qda.pred <- predict(qda.fit, newdata = test_set)
+
+#Confusion Matrix
+qda.cm <- confusionMatrix(table(Predicted = qda.pred$class, Actual = test_set$Class), positive="1")
+qda.cm
+
+# Plot the ROC curve
+qda_roc <- roc(test_set$Class ~ qda.pred$posterior[,2],plot=T,print.auc=T, levels = c(0, 1), direction = "<")
+```
+
+## XGBoost
+
+```{r message=FALSE, warning=FALSE}
+set.seed(222)
+data <- train_set
+
+# Split the data into features (X) and the target variable (y)
+X <- data[, 1:(ncol(data)-1)]  # the target variable is in the last column
+y <- as.numeric(data$Class) - 1   # the target variable is in the last column
+
+# Convert the data to a DMatrix format required by XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(X), label = y)
+
+# Specify the XGBoost parameters
+params <- list(
+  objective = "binary:logistic",  # For binary classification
+  eval_metric = "logloss",        # Evaluation metric
+  max_depth = 6,                  # Maximum tree depth
+  eta = 0.2,                      # Learning rate
+  nrounds = 100                   # Number of boosting rounds (trees)
+)
+# Train the XGBoost model
+xgb_model <- xgboost(params = params, data = dtrain, nrounds = params$nrounds)
+
+# Make predictions on a new dataset 
+new_data <- test_set
+new_data_matrix <- as.matrix(new_data[, -ncol(new_data)]) 
+dtest <- xgb.DMatrix(data = new_data_matrix)
+
+# Predict probabilities for the positive class (Class 1)
+xgb.pred <- predict(xgb_model, new_data_matrix)
+
+threshold <- 0.5  # Adjust threshold as needed
+xgb.pred.class <- ifelse(xgb.pred > threshold, 1, 0)
+
+#Confusion Matrix
+xgb.cm <- confusionMatrix(table(Predicted = xgb.pred.class, Actual = new_data$Class), positive="1")
+xgb.cm
+
+# Plot the ROC curve
+xgboost_roc <- roc(test_set$Class ~ xgb.pred,plot=T,print.auc=T, levels = c(0, 1), direction = "<")
+```
+
+
+```{r message=FALSE, warning=FALSE}
+plot(log_roc, col = 1,main = "ROC")
+lines(lda_roc, col = 2)
+lines(qda_roc, col = 3)
+lines(xgboost_roc, col = 4)
+
+# Add a legend to the plot
+legend("bottomright", legend = c("Logistic", "LDA", "QDA", "XGBoost"), col = c(1, 2, 3, 4), lty = 1)
+```
+
+
+# Conclusions
+
+Throughout this paper, we looked at the credit card data set containing transactions made by credit cards in September 2013 by European cardholders over two days. There were 284,807 transactions total and 31 variables included. 492 transactions were fraudulent, demonstrating the degree of the imbalance as the positive class (fraudulent) accounted for 0.172% of all transactions. This was an exercise in dealing with highly imbalanced data that required careful analysis. Proceeding without accounting for the imbalance would have given misinformed results. 
+
+This paper  argued how confusion matrix accuracy was not an appropriate measure for model performance. Utilizing the Area Under the Precision-Recall Curve (AUC) to determine between using an up sampling, down-sampling, and SMOTE sampling technique on the response variable was more effective. The down-sampling technique achieved the best AUC score of 0.9423, and gave significant improvement in the overall model performance over imbalanced data (AUC = 0.8952). The best AUC score achieved by the algorithmic models tested was the Random Forests model at 0.9842. With some adjustments in tuning the Random Forests parameters, it could be possible to achieve an even stronger score.
+
+
+## Confronting the Imbalance: Determining a Sampling Technique
+
+The credit card data set is highly imbalanced, and as such we will need to measure the accuracy using the Area Under the Precision-Recall Curve (AUC). In this analysis, we will overview, apply, and compare three different sampling techniques, Up-Sampling, Down-Sampling, and Synthetic Minority Sampling Technique (SMOTE).
+
+Up-Sampling is when synthetically generated data that corresponds with the fraudulent class are injected into the data set. Once this has been done, the counts of both non-fraudulent and fraudulent are approximately the same. In short, this technique is to equalize the model so as to not incline towards the non-fraudulent class, which is the majority class in this example. The main downside of this procedure is that it introduces bias since we are presenting additional data.
+
+Down-Sampling is effectively the opposite of Up-Sampling, whereby points from the non-fraudulent class are randomly removed until the counts of both non-fraudulent and fraudulent transactions are approximately the same. Similarly this technique is to equalize the model as to not incline towards the non-fraudulent, majority class. The obvious downside to this procedure is that we are randomly removing observations from the non-fraudulent class that might contain useful - and perhaps critical - information when it comes to fitting a good decision boundary.
+
+Synthetic Minority Oversampling Technique (SMOTE) is when the non-fraudulent majority class is down-sampled while the fraudulent minority class is simultaneously synthesized to create new instances by interpolating between existing ones. It utilizes the k-nearest neighbor algorithm to create this synthesized data. The downside of SMOTE is that it does not take into consideration neighboring instances from the non-fraudulent majority class while creating this new synthetic data, which can increase overlapping of classes and introduce additional noise.
+
+```{r}
+samp.r.t <- c()
+samp.f.t <- c()
+
+### Original class ratio
+og.t <- table(train_set$Class)
+samp.r.t <- cbind(samp.r.t, "Non-Fraudulent" = og.t[1])
+samp.r.t <- cbind(samp.r.t, "Fraudulent" = og.t[2])
+samp.r.t <- cbind(samp.r.t, "Majority Ratio" = round(og.t[1]/og.t[2], 2))
+samp.f.t <- rbind(samp.f.t, samp.r.t)
+samp.r.t <- c()
+
+### Up-Sampling
+set.seed(22)
+samp.up <- upSample(x = train_set[, -ncol(train_set)], y = train_set$Class)
+su.t <- table(samp.up$Class)
+samp.r.t <- cbind(samp.r.t, "Non-Fraudulent" = su.t[1])
+samp.r.t <- cbind(samp.r.t, "Fraudulent" = su.t[2])
+samp.r.t <- cbind(samp.r.t, "Majority Ratio" = round(su.t[1]/su.t[2], 2))
+samp.f.t <- rbind(samp.f.t, samp.r.t)
+samp.r.t <- c()
+
+### Down-Sampling
+set.seed(22)
+samp.down <- downSample(x = train_set[, -ncol(train_set)], y = train_set$Class)
+sd.t <- table(samp.down$Class)
+samp.r.t <- cbind(samp.r.t, "Non-Fraudulent" = sd.t[1])
+samp.r.t <- cbind(samp.r.t, "Fraudulent" = sd.t[2])
+samp.r.t <- cbind(samp.r.t, "Majority Ratio" = round(sd.t[1]/sd.t[2], 2))
+samp.f.t <- rbind(samp.f.t, samp.r.t)
+samp.r.t <- c()
+
+### SMOTE Sampling
+set.seed(22)
+samp.smote <- SMOTE(Class ~., data = train_set)
+smote.t <- table(samp.smote$Class)
+samp.r.t <- cbind(samp.r.t, "Non-Fraudulent" = smote.t[1])
+samp.r.t <- cbind(samp.r.t, "Fraudulent" = smote.t[2])
+samp.r.t <- cbind(samp.r.t, "Majority Ratio" = round(smote.t[1]/smote.t[2], 2))
+samp.f.t <- rbind(samp.f.t, samp.r.t)
+samp.r.t <- c()
+
+### Construct comparison table
+samp.f.t <- rbind(samp.f.t, samp.r.t)
+rownames(samp.f.t) <- c('IMBALANCED (ORGINAL)','UP-SAMPLED','DOWN-SAMPLED', 'SMOTE-SAMPLED')
+samp.f.t
+```
+
+**Table 2: Counts and ratios of original training set along with other sampling techniques**
+
+**Table 2** gives a look at how the counts of the training set is adjusted given the chosen sampling techniques described above.
+
+To evaluate which sampling method is best for the purposes of fitting to future algorithms, a decision tree is used on each sampling technique. The ROC curve of each can be observed as shown in **Figure 5**. 
+
+```{r}
+### Generate QDA performance on imbalanced training data
+set.seed(222)
+og.fit <- qda(Class ~., data = train_set)
+og.pred <- predict(og.fit, newdata = test_set)
+og.cm <- confusionMatrix(table(Predicted = og.pred$class, Actual = test_set$Class), positive="1")
+
+### Generate QDA performance on up-sampled training data
+set.seed(222)
+su.fit <- qda(Class ~., data = samp.up)
+su.pred <- predict(su.fit, newdata = test_set)
+su.cm <- confusionMatrix(table(Predicted = su.pred$class, Actual = test_set$Class), positive="1")
+
+### Generate QDA performance on down-sampled training data
+set.seed(222)
+sd.fit <- qda(Class ~., data = samp.down)
+sd.pred <- predict(sd.fit, newdata = test_set)
+sd.cm <- confusionMatrix(table(Predicted = sd.pred$class, Actual = test_set$Class), positive="1")
+
+### Generate QDA performance on SMOTE sampled training data
+set.seed(222)
+smote.fit <- qda(Class ~., data = samp.smote)
+smote.pred <- predict(smote.fit, newdata = test_set)
+smote.cm <- confusionMatrix(table(Predicted = smote.pred$class, Actual = test_set$Class), positive="1")
+```
+
+```{r}
+#Confusion Matrices
+og.cm
+su.cm
+sd.cm
+smote.cm
+```
+
+
+```{r message=FALSE, warning=FALSE}
+### Setup plot space
+par(mfrow=c(2,2))
+
+og.roc <- roc(test_set$Class ~ og.pred$posterior[,2],plot=T,print.auc=T, levels = c(0, 1), direction = "<")
+su.roc <- roc(test_set$Class ~ su.pred$posterior[,2],plot=T,print.auc=T, levels = c(0, 1), direction = "<")
+sd.roc <- roc(test_set$Class ~ sd.pred$posterior[,2],plot=T,print.auc=T, levels = c(0, 1), direction = "<")
+smote.roc <- roc(test_set$Class ~ smote.pred$posterior[,2],plot=T,print.auc=T, levels = c(0, 1), direction = "<")
+```
+
+**From Left-Right, Top-Bottom, QDA performance ROC curve on imbalanced, up-sampled, down-sampled, and SMOTE sampled training data**
